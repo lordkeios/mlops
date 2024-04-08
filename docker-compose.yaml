@@ -1,0 +1,243 @@
+version: "3.3"
+
+services:
+  db:
+    restart: always
+    image: postgres
+    container_name: mlflow_db
+    expose:
+      - "${PG_PORT}"
+    networks:
+      - backend
+    environment:
+      - POSTGRES_USER=${PG_USER}
+      - POSTGRES_PASSWORD=${PG_PASSWORD}
+      - POSTGRES_DATABASE=${PG_DATABASE}
+    volumes:
+      - ./data/postgresql:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD", "pg_isready", "-p", "${PG_PORT}", "-U", "${PG_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+
+  mongo:
+    container_name: mongo
+    image: mongo
+    ports:
+      - "27018:27017"
+    volumes:
+      - ./data/mongo:/data/db
+    networks:
+      - backend
+
+  s3:
+    restart: always
+    image: minio/minio
+    container_name: mlflow_minio
+    volumes:
+      - /mnt/f/minio:/data
+    ports:
+      - "${MINIO_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    networks:
+      - frontend
+      - backend
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_ADDRESS=${MINIO_ADDRESS}
+      - MINIO_PORT=${MINIO_PORT}
+      - MINIO_STORAGE_USE_HTTPS=${MINIO_STORAGE_USE_HTTPS}
+      - MINIO_CONSOLE_ADDRESS=${MINIO_CONSOLE_ADDRESS}
+    command: server /data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  prometheus:
+    container_name: prometheus
+    image: prom/prometheus
+    depends_on:
+      - mongo
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./data/prometheus:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9091:9090"
+    networks:
+      - backend
+    restart: always
+
+  grafana:
+    container_name: grafana
+    image: grafana/grafana
+    user: "1000"
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/grafana_datasources.yml:/etc/grafana/provisioning/datasources/grafana_datasources.yml:ro
+      - ./grafana/grafana_dashboards.yml:/etc/grafana/provisioning/dashboards/grafana_dashboards.yml:ro
+      - ./grafana/dashboards:/opt/grafana/dashboards
+      - ./data/grafana:/var/lib/grafana
+    networks:
+      - frontend
+      - backend
+    restart: always
+      
+  mlflow_server:
+    restart: always
+    build: ./mlflow
+    image: mlflow_server
+    container_name: mlflow_server
+    depends_on:
+      - db
+    ports:
+      - "${MLFLOW_PORT}:5000"
+    networks:
+      - frontend
+      - backend
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_ACCESS_KEY}
+      - MLFLOW_S3_ENDPOINT_URL=http://s3:${MINIO_PORT}
+      - MLFLOW_S3_IGNORE_TLS=true
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://${PG_USER}:${PG_PASSWORD}@db:${PG_PORT}/${PG_DATABASE}
+      --host 0.0.0.0
+      --serve-artifacts
+      --artifacts-destination s3://${MLFLOW_BUCKET_NAME}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${MLFLOW_PORT}/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  prefect_server:
+    restart: always
+    build:
+      context: ./prefect
+      dockerfile: Dockerfile
+    logging:
+      driver: none
+    image: prefect_server
+    container_name: prefect_server
+    ports:
+      - ${PREFECT_PORT}:4200
+      - ${PREFECT_UI_PORT}:8081
+    env_file:
+      - ./prefect/.env
+    networks:
+      - frontend
+      - backend
+    environment:
+      - PREFECT_SERVER_CSRF_PROTECTION_ENABLED=False
+      - PREFECT_CLIENT_CSRF_SUPPORT_ENABLED=False
+      - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_ACCESS_KEY}
+      - MLFLOW_S3_ENDPOINT_URL=http://s3:${MINIO_PORT}
+      - MLFLOW_S3_IGNORE_TLS=true
+    volumes:
+      - ./data/prefect/data:/root/.prefect
+      - ./data/prefect/flows:/flows
+      - ./data/artifacts:/data/artifacts
+      - ./data/store:/data/store
+
+  prefect_agent:
+    restart: always
+    depends_on:
+      - prefect_server
+      - mlflow_server
+    build:
+      context: ./prefect-agent
+      dockerfile: Dockerfile
+    image: prefect_agent
+    container_name: prefect_agent
+    environment:
+      MONGODB_ADDRESS: "mongodb://mongo:27017"
+      REPORTS_FOLDER: /data/reports
+      REPORT_TIME_WINDOW_MINUTES: 180
+      EVIDENTLY_TIME_WIDTH_MINS: 720
+      MLFLOW_TRACKING_URI: "http://mlflow_server:5000"
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_ACCESS_KEY}
+      MLFLOW_S3_ENDPOINT_URL: "http://s3:${MINIO_PORT}"
+      MLFLOW_S3_IGNORE_TLS: true
+      DATASET_STORAGE_URL_PREFIX: "s3://mlops"
+    volumes:
+      - ./data/artifacts:/data/artifacts
+      - ./data/store:/data/store
+      - ./data/reports:/data/reports
+    networks:
+      - backend
+  
+  prediction_service:
+    container_name: prediction_service
+    image: prediction_service
+    build:
+      context: ./prediction
+      dockerfile: Dockerfile
+    depends_on:
+      - evidently_service
+      - mongo
+    environment:
+      EVIDENTLY_SERVICE: "http://evidently_service:8877"
+      MLFLOW_TRACKING_URI: "http://mlflow_server:5000"
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_ACCESS_KEY}
+      MLFLOW_S3_ENDPOINT_URL: http://s3:${MINIO_PORT}
+      MLFLOW_S3_IGNORE_TLS: true
+    ports:
+      - "9696:9696"
+    networks:
+      - frontend
+      - backend
+
+  evidently_service:
+    container_name: evidently_service
+    image: evidently_service
+    build:
+      context: ./evidently
+      dockerfile: Dockerfile
+    depends_on:
+      - grafana
+    volumes:
+      - ./datasets/evidently:/app/datasets
+      - ./evidently/config.yaml:/app/config.yaml
+    ports:
+      - "8877:8877"
+    networks:
+      - frontend
+      - backend
+
+  reporting:
+    restart: always
+    container_name: reporting_agent
+    image: reporting_agent
+    build:
+      context: ./reporting
+      dockerfile: Dockerfile
+    depends_on:
+      - prefect_server
+      - mlflow_server
+      - mongo
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_ACCESS_KEY}
+      - MLFLOW_S3_ENDPOINT_URL=http://s3:${MINIO_PORT}
+      - MLFLOW_S3_IGNORE_TLS=true
+    networks:
+      - backend
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
